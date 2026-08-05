@@ -41,6 +41,12 @@ Run `:MeatReview` from a Neovim instance opened within the repository you want t
 the current branch's open PR, fetches its GitHub diff, and runs Meat asynchronously. Neovim remains usable while this
 happens. When the ready notification appears, run `:MeatReview` again to open the review in a new tab.
 
+Every invocation checks the repository, local branch, and head revision before reusing a review. Switching branches
+automatically activates the matching PR. Exact repository/PR/head revisions are cached in memory, so returning to a branch
+during the same Neovim process restores its mapped review and drafts without running Meat again. A new head SHA creates a
+fresh review revision; Meat may satisfy that run from its own persistent diff cache. Old inline drafts remain attached only
+to their original revision and are never copied onto new coordinates.
+
 Only exact added and deleted lines retained by Meat can receive comments. Drafts live only in the current Neovim process.
 Press `S`, or run `:MeatReviewSubmit`, to open the editable “Finish your review” floating panel over the Meat review. Write
 a top-level Markdown comment in the real buffer; inline drafts appear below as read-only virtual lines. Three visible
@@ -91,7 +97,7 @@ stylua lua plugin tests
 
 ## MVP limitations
 
-- One active review session per Neovim instance, with no persistence after exit
+- One visible active review with dormant per-revision sessions in memory; plugin drafts do not persist after exit
 - Unified reading view only; no side-by-side diff
 - Single-line anchors on exact retained additions or deletions only
 - No range annotations or replies

@@ -9,7 +9,9 @@ vim.api.nvim_set_hl(0, 'MeatReviewDraftRail', { default = true, link = 'Comment'
 vim.api.nvim_set_hl(0, 'MeatReviewDraftLabel', { default = true, link = 'DiagnosticInfo' })
 vim.api.nvim_set_hl(0, 'MeatReviewDraftText', { default = true, link = 'Normal' })
 
+local sessions = {}
 local session = { state = 'idle', comments = {} }
+local checking_identity = false
 
 local function notify(message, level)
   vim.notify(message, level or vim.log.levels.INFO, { title = 'Meat Review' })
@@ -46,106 +48,84 @@ local function decode(value, label)
   return decoded
 end
 
-local function fail(message)
-  session = { state = 'idle', comments = {} }
+local function session_key(repo, pr)
+  return table.concat({ repo, tostring(pr.number), pr.headRefOid }, '\0')
+end
+
+local function fail_review(target, message)
+  sessions[target.key] = nil
+  if session == target then
+    session = { state = 'idle', comments = {} }
+  end
   notify(message, vim.log.levels.ERROR)
 end
 
-local function start()
-  session = {
-    state = 'running',
-    stage = 'Resolving repository',
-    started_at = vim.uv.hrtime(),
-    comments = {},
-  }
-  notify('Starting Meat review…')
-
-  run({ 'git', 'rev-parse', '--show-toplevel' }, {}, function(root, err)
-    if err then
-      return fail('Could not resolve repository root: ' .. err)
+local function process_review(target)
+  target.stage = 'Fetching GitHub diff'
+  run({ 'gh', 'pr', 'diff', tostring(target.pr.number) }, { cwd = target.root }, function(raw_diff, diff_err)
+    if diff_err then
+      return fail_review(target, 'Could not fetch PR diff: ' .. diff_err)
     end
-    root = root:gsub('%s+$', '')
-    if vim.fn.executable('gh') ~= 1 then
-      return fail('Required executable not found: gh')
+    local meat_options = { cwd = target.root, stdin = raw_diff }
+    if vim.env.MEAT_OPENAI_API_KEY and vim.env.MEAT_OPENAI_API_KEY ~= '' then
+      meat_options.env = { OPENAI_API_KEY = vim.env.MEAT_OPENAI_API_KEY }
     end
-    if vim.fn.executable('meat') ~= 1 then
-      return fail('Required executable not found: meat')
-    end
-
-    session.stage = 'Fetching repository identity'
-    run({ 'gh', 'repo', 'view', '--json', 'nameWithOwner' }, { cwd = root }, function(repo_json, repo_err)
-      if repo_err then
-        return fail('Could not identify GitHub repository: ' .. repo_err)
+    target.stage = 'Running Meat'
+    run({ 'meat', '-json' }, meat_options, function(meat_json, meat_err)
+      if meat_err then
+        return fail_review(target, 'Meat failed: ' .. meat_err)
       end
-      local repo, repo_decode_err = decode(repo_json, 'repository')
-      if not repo then
-        return fail(repo_decode_err)
+      local meat, meat_decode_err = decode(meat_json, 'Meat result')
+      if not meat then
+        return fail_review(target, meat_decode_err)
       end
-      if type(repo.nameWithOwner) ~= 'string' or not repo.nameWithOwner:match('^[^/]+/[^/]+$') then
-        return fail('GitHub repository identity is missing or unsupported')
+      if type(meat.summary) ~= 'string' or type(meat.smart_diff) ~= 'string' or meat.elision == nil then
+        return fail_review(target, 'Meat result is missing summary, elision, or smart_diff')
+      end
+      target.stage = 'Mapping review'
+      local ok, view = pcall(diff.build_view, raw_diff, meat.smart_diff)
+      if not ok then
+        return fail_review(target, 'Could not map Meat diff: ' .. concise_error(view))
       end
 
-      local fields = 'number,url,title,state,baseRefName,headRefName,headRefOid'
-      session.stage = 'Discovering pull request'
-      run({ 'gh', 'pr', 'view', '--json', fields }, { cwd = root }, function(pr_json, pr_err)
-        if pr_err then
-          return fail('Could not find a pull request for the current branch: ' .. pr_err)
-        end
-        local pr, pr_decode_err = decode(pr_json, 'pull request')
-        if not pr then
-          return fail(pr_decode_err)
-        end
-        if pr.state ~= 'OPEN' then
-          return fail('The current branch does not have an open pull request')
-        end
-        if type(pr.number) ~= 'number' or type(pr.headRefOid) ~= 'string' then
-          return fail('Pull request metadata is incomplete')
-        end
+      target.state = 'ready'
+      target.raw_diff = raw_diff
+      target.meat = meat
+      target.view = view
+      notify(('Meat review ready for PR #%d — run :MeatReview to open'):format(target.pr.number))
+    end)
+  end)
+end
 
-        session.stage = 'Fetching GitHub diff'
-        run({ 'gh', 'pr', 'diff', tostring(pr.number) }, { cwd = root }, function(raw_diff, diff_err)
-          if diff_err then
-            return fail('Could not fetch PR diff: ' .. diff_err)
-          end
-          local meat_options = { cwd = root, stdin = raw_diff }
-          if vim.env.MEAT_OPENAI_API_KEY and vim.env.MEAT_OPENAI_API_KEY ~= '' then
-            meat_options.env = { OPENAI_API_KEY = vim.env.MEAT_OPENAI_API_KEY }
-          end
-          session.stage = 'Running Meat'
-          run({ 'meat', '-json' }, meat_options, function(meat_json, meat_err)
-            if meat_err then
-              return fail('Meat failed: ' .. meat_err)
-            end
-            local meat, meat_decode_err = decode(meat_json, 'Meat result')
-            if not meat then
-              return fail(meat_decode_err)
-            end
-            if type(meat.summary) ~= 'string' or type(meat.smart_diff) ~= 'string' or meat.elision == nil then
-              return fail('Meat result is missing summary, elision, or smart_diff')
-            end
-            session.stage = 'Mapping review'
-            local ok, view = pcall(diff.build_view, raw_diff, meat.smart_diff)
-            if not ok then
-              return fail('Could not map Meat diff: ' .. concise_error(view))
-            end
+local function discover_pr(root, callback)
+  run({ 'gh', 'repo', 'view', '--json', 'nameWithOwner' }, { cwd = root }, function(repo_json, repo_err)
+    if repo_err then
+      return callback(nil, 'Could not identify GitHub repository: ' .. repo_err)
+    end
+    local repo, repo_decode_err = decode(repo_json, 'repository')
+    if not repo then
+      return callback(nil, repo_decode_err)
+    end
+    if type(repo.nameWithOwner) ~= 'string' or not repo.nameWithOwner:match('^[^/]+/[^/]+$') then
+      return callback(nil, 'GitHub repository identity is missing or unsupported')
+    end
 
-            session = {
-              state = 'ready',
-              root = root,
-              repo = repo.nameWithOwner,
-              pr = pr,
-              raw_diff = raw_diff,
-              meat = meat,
-              view = view,
-              head_sha = pr.headRefOid,
-              comments = {},
-              review_body = '',
-              review_event = 'COMMENT',
-            }
-            notify(('Meat review ready for PR #%d — run :MeatReview to open'):format(pr.number))
-          end)
-        end)
-      end)
+    local fields = 'number,url,title,state,baseRefName,headRefName,headRefOid'
+    run({ 'gh', 'pr', 'view', '--json', fields }, { cwd = root }, function(pr_json, pr_err)
+      if pr_err then
+        return callback(nil, 'Could not find a pull request for the current branch: ' .. pr_err)
+      end
+      local pr, pr_decode_err = decode(pr_json, 'pull request')
+      if not pr then
+        return callback(nil, pr_decode_err)
+      end
+      if pr.state ~= 'OPEN' then
+        return callback(nil, 'The current branch does not have an open pull request')
+      end
+      if type(pr.number) ~= 'number' or type(pr.headRefOid) ~= 'string' then
+        return callback(nil, 'Pull request metadata is incomplete')
+      end
+      callback({ root = root, repo = repo.nameWithOwner, pr = pr })
     end)
   end)
 end
@@ -342,6 +322,7 @@ local function close_tab()
 end
 
 local function open_review()
+  local review_session = session
   vim.cmd('tabnew')
   local win = vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_create_buf(false, true)
@@ -351,12 +332,12 @@ local function open_review()
   vim.bo[buf].swapfile = false
   vim.bo[buf].modifiable = true
   vim.bo[buf].filetype = 'diff'
-  vim.api.nvim_buf_set_name(buf, ('Meat Review PR #%d'):format(session.pr.number))
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, session.view.lines)
+  vim.api.nvim_buf_set_name(buf, ('Meat Review PR #%d'):format(review_session.pr.number))
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, review_session.view.lines)
   vim.bo[buf].modifiable = false
   vim.wo[win].wrap = false
   vim.wo[win].signcolumn = 'yes'
-  session.buf, session.win, session.state = buf, win, 'open'
+  review_session.buf, review_session.win, review_session.state = buf, win, 'open'
 
   add_header(buf)
   highlight_view(buf)
@@ -386,19 +367,44 @@ local function open_review()
     buffer = buf,
     once = true,
     callback = function()
-      if session.buf == buf then
-        session.buf, session.win, session.state = nil, nil, 'ready'
+      if review_session.buf == buf then
+        review_session.buf, review_session.win, review_session.state = nil, nil, 'ready'
       end
     end,
   })
 end
 
-function M.open()
-  if session.state == 'idle' then
-    start()
-  elseif session.state == 'running' then
-    notify('Meat review is still running…')
-  elseif session.state == 'ready' then
+local function close_session_ui(target)
+  if target.preview_win and vim.api.nvim_win_is_valid(target.preview_win) then
+    vim.api.nvim_win_close(target.preview_win, true)
+  end
+  target.preview_buf, target.preview_win = nil, nil
+  if target.win and vim.api.nvim_win_is_valid(target.win) then
+    local tab = vim.api.nvim_win_get_tabpage(target.win)
+    if vim.api.nvim_tabpage_is_valid(tab) and #vim.api.nvim_list_tabpages() > 1 then
+      vim.api.nvim_set_current_tabpage(tab)
+      vim.cmd('tabclose')
+    elseif target.buf and vim.api.nvim_buf_is_valid(target.buf) then
+      vim.api.nvim_buf_delete(target.buf, { force = true })
+    end
+  elseif target.buf and vim.api.nvim_buf_is_valid(target.buf) then
+    vim.api.nvim_buf_delete(target.buf, { force = true })
+  end
+  target.buf, target.win = nil, nil
+  if target.state == 'open' then
+    target.state = 'ready'
+  end
+end
+
+local function activate(target)
+  if session ~= target then
+    close_session_ui(session)
+    session = target
+  end
+end
+
+local function show_active()
+  if session.state == 'ready' then
     open_review()
   elseif session.state == 'open' then
     if session.win and vim.api.nvim_win_is_valid(session.win) then
@@ -411,8 +417,99 @@ function M.open()
   end
 end
 
+local function discovery_failed(message)
+  checking_identity = false
+  notify(message, vim.log.levels.ERROR)
+end
+
+local function select_discovered(identity, announced_start)
+  checking_identity = false
+  local key = session_key(identity.repo, identity.pr)
+  local cached = sessions[key]
+  if cached then
+    local changed = cached ~= session
+    activate(cached)
+    if changed then
+      notify(('Restored cached Meat review for PR #%d'):format(cached.pr.number))
+    end
+    return show_active()
+  end
+
+  local target = {
+    key = key,
+    state = 'running',
+    stage = 'Fetching GitHub diff',
+    started_at = vim.uv.hrtime(),
+    root = identity.root,
+    repo = identity.repo,
+    pr = identity.pr,
+    head_sha = identity.pr.headRefOid,
+    comments = {},
+    review_body = '',
+    review_event = 'COMMENT',
+  }
+  activate(target)
+  sessions[key] = target
+  if not announced_start then
+    notify('Starting Meat review…')
+  end
+  process_review(target)
+end
+
+function M.open()
+  if checking_identity or session.state == 'running' or session.submitting then
+    return notify('Meat review is still running…')
+  end
+
+  local announced_start = session.state == 'idle'
+  checking_identity = true
+  if announced_start then
+    notify('Starting Meat review…')
+  end
+  run({ 'git', 'rev-parse', '--show-toplevel' }, {}, function(root, root_err)
+    if root_err then
+      return discovery_failed('Could not resolve repository root: ' .. root_err)
+    end
+    root = root:gsub('%s+$', '')
+    if vim.fn.executable('gh') ~= 1 then
+      return discovery_failed('Required executable not found: gh')
+    end
+    if vim.fn.executable('meat') ~= 1 then
+      return discovery_failed('Required executable not found: meat')
+    end
+
+    local function discover()
+      discover_pr(root, function(identity, err)
+        if err then
+          return discovery_failed(err)
+        end
+        select_discovered(identity, announced_start)
+      end)
+    end
+
+    if session.state == 'idle' or session.root ~= root then
+      return discover()
+    end
+    local identity_args = { 'git', 'status', '--porcelain=v2', '--branch', '--untracked-files=no' }
+    run(identity_args, { cwd = root }, function(stdout, local_err)
+      if local_err then
+        return discover()
+      end
+      local local_head = stdout:match('# branch%.oid ([^\n]+)')
+      local local_branch = stdout:match('# branch%.head ([^\n]+)')
+      if local_head == session.head_sha and local_branch == session.pr.headRefName then
+        checking_identity = false
+        return show_active()
+      end
+      discover()
+    end)
+  end)
+end
+
 function M.status()
-  if session.state == 'idle' then
+  if checking_identity then
+    notify('Meat review: Discovering current pull request')
+  elseif session.state == 'idle' then
     notify('No active Meat review.')
   elseif session.state == 'running' then
     local elapsed = math.floor((vim.uv.hrtime() - session.started_at) / 1e9)
@@ -579,7 +676,7 @@ local function render_submission_editor(buf, review_event, drafts)
 end
 
 function M.submit()
-  if session.state == 'idle' or session.state == 'running' then
+  if checking_identity or session.state == 'idle' or session.state == 'running' then
     return notify('No completed Meat review is available.', vim.log.levels.WARN)
   end
   if session.preview_win and vim.api.nvim_win_is_valid(session.preview_win) then
