@@ -105,6 +105,12 @@ test('handles multiple files and multiple hunks', function()
   local raw = first .. '\n' .. second
   local view = diff.build_view(raw, raw)
   equal(#view.files, 2)
+  local second_file = view.file_contexts[view.files[2]]
+  equal(second_file.path, 'second.lua')
+  local first_lines = diff.file_lines(raw, 'example.lua')
+  local second_lines = diff.file_lines(raw, 'second.lua')
+  equal(first_lines[#first_lines], '+b')
+  equal(second_lines[#second_lines], '+f')
   equal(location_for(view, '+d').path, 'second.lua')
   equal(location_for(view, '+f').line, 20)
 end)
@@ -121,6 +127,29 @@ test('resolves duplicate changed rows in source order', function()
   local view = diff.build_view(raw, raw)
   equal(location_for(view, '+same', 1).line, 1)
   equal(location_for(view, '+same', 2).line, 3)
+end)
+
+test('maps commit rows onto unambiguous aggregate PR locations', function()
+  local commit = one_file(table.concat({ '@@ -1 +10 @@', '-old', '+new' }, '\n'))
+  local review = one_file(
+    table.concat({
+      '@@ -5 +10 @@',
+      '-old',
+      '+new',
+      '@@ -20 +25 @@',
+      '-old',
+      '+other',
+    }, '\n')
+  )
+  local view = diff.build_view(commit, commit)
+  local _, deleted_line = location_for(view, '-old')
+  local _, added_line = location_for(view, '+new')
+  diff.map_review_locations(view, review, false)
+  equal(view.source_locations[deleted_line].line, 1)
+  equal(view.locations[deleted_line], nil, 'ambiguous deleted rows must not receive a PR anchor')
+  equal(view.locations[added_line].line, 10)
+  equal(view.locations[added_line].side, 'RIGHT')
+  equal(view.unmapped_count, 1)
 end)
 
 test('maps new and deleted files', function()

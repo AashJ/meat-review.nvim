@@ -58,7 +58,7 @@ vim.system = function(args, options, callback)
   if vim.deep_equal(args, { 'git', 'rev-parse', '--show-toplevel' }) then
     response = { stdout = '/tmp/example\n' }
   elseif vim.deep_equal(args, { 'gh', 'repo', 'view', '--json', 'nameWithOwner' }) then
-    response = { stdout = '{"nameWithOwner":"owner/repo"}' }
+    response = { stdout = '{"nameWithOwner":"owner/fork"}' }
   elseif args[1] == 'gh' and args[2] == 'pr' and args[3] == 'view' then
     response = {
       stdout = vim.json.encode({
@@ -116,7 +116,7 @@ assert(notifications[1] == 'Starting Meat review…')
 assert(#calls == 1, 'start should return while repository discovery is pending')
 
 review.status()
-assert(notifications[#notifications]:match('Meat review: Discovering current pull request'))
+assert(notifications[#notifications]:match('Meat review: Discovering review target'))
 
 review.open()
 assert(notifications[#notifications] == 'Meat review is still running…')
@@ -164,6 +164,17 @@ for index, line in ipairs(vim.api.nvim_buf_get_lines(review_buf, 0, -1, false)) 
 end
 assert(changed_line, 'mapped addition is missing from the review')
 vim.api.nvim_win_set_cursor(0, { changed_line, 0 })
+local opened_context
+review.setup({
+  open_file = function(context)
+    opened_context = context
+  end,
+})
+mapping(review_buf, 'n', 'o')()
+assert(opened_context.kind == 'pr' and opened_context.path == 'example.lua')
+assert(opened_context.base_sha == 'base123' and opened_context.head_sha == 'abc123')
+assert(opened_context.line == 1 and opened_context.side == 'RIGHT')
+assert(#calls == calls_before_preview, 'a configured file opener must not run external commands')
 mapping(review_buf, 'n', 'a')()
 
 local editor_buf = vim.api.nvim_get_current_buf()

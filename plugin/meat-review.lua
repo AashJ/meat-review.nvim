@@ -7,6 +7,14 @@ vim.api.nvim_create_user_command('MeatReview', function()
   require('meat-review').open()
 end, {})
 
+vim.api.nvim_create_user_command('MeatReviewCommit', function()
+  require('meat-review').open_commit()
+end, {})
+
+vim.api.nvim_create_user_command('MeatReviewOpenFile', function()
+  require('meat-review').open_file()
+end, {})
+
 vim.api.nvim_create_user_command('MeatReviewSubmit', function()
   require('meat-review').submit()
 end, {})

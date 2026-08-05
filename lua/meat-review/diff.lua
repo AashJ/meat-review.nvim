@@ -28,14 +28,17 @@ local function header_path(line, prefix, path_prefix)
   return value, true
 end
 
-local function parse_raw(raw_diff)
+local function parse_raw(raw_diff, include_raw_lines)
   local parsed = { files = {}, rows = {} }
   local file
   local old_line, new_line
 
   for _, text in ipairs(split_lines(raw_diff)) do
+    if include_raw_lines and file and not text:match('^diff %-%-git ') then
+      file.raw_lines[#file.raw_lines + 1] = text
+    end
     if text:match('^diff %-%-git ') then
-      file = { supported = true }
+      file = { supported = true, raw_lines = include_raw_lines and { text } or nil }
       parsed.files[#parsed.files + 1] = file
       parsed.rows[#parsed.rows + 1] = { kind = 'file', text = text, file = file }
       old_line, new_line = nil, nil
@@ -81,6 +84,63 @@ local function parse_raw(raw_diff)
   return parsed
 end
 
+function M.file_lines(raw_diff, path)
+  assert(type(raw_diff) == 'string', 'raw_diff must be a string')
+  assert(type(path) == 'string', 'path must be a string')
+  for _, file in ipairs(parse_raw(raw_diff, true).files) do
+    if file.path == path then
+      return file.raw_lines
+    end
+  end
+end
+
+local function location_key(location)
+  return table.concat({ location.path, location.side, location.text, tostring(location.line) }, '\0')
+end
+
+local function add_candidate(candidates, key, location)
+  local matches = candidates[key]
+  if not matches then
+    matches = {}
+    candidates[key] = matches
+  end
+  matches[#matches + 1] = location
+end
+
+function M.map_review_locations(view, review_diff, same_base)
+  assert(type(view) == 'table' and type(view.locations) == 'table', 'view must contain locations')
+  assert(type(review_diff) == 'string', 'review_diff must be a string')
+
+  local exact = {}
+  for _, row in ipairs(parse_raw(review_diff).rows) do
+    if row.location and row.file.supported then
+      local location = {
+        path = row.file.path,
+        line = row.location.line,
+        side = row.location.side,
+        text = row.location.text,
+      }
+      add_candidate(exact, location_key(location), location)
+    end
+  end
+
+  local source_locations = view.locations
+  local mapped_locations, used = {}, {}
+  for line, source in pairs(source_locations) do
+    local matches = (source.side == 'RIGHT' or same_base) and exact[location_key(source)] or nil
+    local mapped = matches and #matches == 1 and matches[1] or nil
+    if mapped and not used[mapped] then
+      used[mapped] = true
+      mapped_locations[line] = vim.deepcopy(mapped)
+    else
+      view.unmapped_count = view.unmapped_count + 1
+    end
+  end
+  view.source_locations = source_locations
+  view.locations = mapped_locations
+  return view
+end
+
 local function is_elision(text)
   return text == '+...' or text == '-...' or text:find('...', 1, true) ~= nil or text:find('…', 1, true) ~= nil
 end
@@ -114,7 +174,7 @@ function M.build_view(raw_diff, smart_diff)
   assert(type(smart_diff) == 'string', 'smart_diff must be a string')
 
   local original = parse_raw(raw_diff)
-  local view = { lines = {}, locations = {}, files = {}, unmapped_count = 0 }
+  local view = { lines = {}, locations = {}, files = {}, file_contexts = {}, unmapped_count = 0 }
   local file, cursor, in_hunk = nil, 1, false
 
   local function append(text)
@@ -135,7 +195,16 @@ function M.build_view(raw_diff, smart_diff)
         end
       end
       local heading = file and file.path or 'Unsupported Git path'
-      view.files[#view.files + 1] = append('── ' .. heading .. ' ──')
+      local rendered = append('── ' .. heading .. ' ──')
+      view.files[#view.files + 1] = rendered
+      if file then
+        view.file_contexts[rendered] = {
+          path = file.path,
+          old_path = file.old_path,
+          new_path = file.new_path,
+          supported = file.supported,
+        }
+      end
     elseif not in_hunk and (text:match('^index ') or text:sub(1, 4) == '--- ' or text:sub(1, 4) == '+++ ') then
       -- Replaced by the clean file heading.
     elseif text:match('^@@') then

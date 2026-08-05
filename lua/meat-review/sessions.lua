@@ -22,7 +22,14 @@ local function validate_pr(pr)
 end
 
 local function identity(root, repo, pr)
-  return { root = root, repo = repo, pr = pr }
+  return { kind = 'pr', root = root, repo = repo, pr = pr }
+end
+
+local function repository_from_pr(pr)
+  if type(pr.url) ~= 'string' then
+    return nil
+  end
+  return pr.url:match('^https?://[^/]+/([^/]+/[^/]+)/pull/%d+/?$')
 end
 
 local function revision_matches(left, right)
@@ -32,7 +39,18 @@ local function revision_matches(left, right)
 end
 
 function M.key(value)
+  if value.kind == 'commit' then
+    return table.concat({
+      'commit',
+      value.repo,
+      tostring(value.pr.number),
+      value.pr.baseRefOid,
+      value.commit.parent or 'ROOT',
+      value.commit.sha,
+    }, '\0')
+  end
   return table.concat({
+    'pr',
     value.repo,
     tostring(value.pr.number),
     value.pr.baseRefOid,
@@ -44,8 +62,14 @@ function M.get(value)
   local cached = cache[M.key(value)]
   if cached then
     cached.root = value.root
-    cached.repo = value.repo
-    cached.pr = value.pr
+    if value.kind == 'pr' then
+      cached.repo = value.repo
+      cached.pr = value.pr
+    else
+      cached.repo = value.repo
+      cached.pr = value.pr
+      cached.commit = value.commit
+    end
   end
   return cached
 end
@@ -68,7 +92,11 @@ local function read_pr(root, repo, number, callback)
     if not valid then
       return callback(nil, validation_err)
     end
-    callback(identity(root, repo, pr))
+    local pr_repo = repository_from_pr(pr)
+    if not pr_repo then
+      return callback(nil, 'Pull request URL is missing or unsupported')
+    end
+    callback(identity(root, pr_repo, pr))
   end)
 end
 
@@ -88,6 +116,37 @@ function M.discover(root, callback)
   end)
 end
 
+function M.discover_commit(root, callback)
+  local args = { 'git', 'show', '-s', '--format=%H%n%P%n%s', 'HEAD' }
+  process.run(args, { cwd = root }, function(stdout, err)
+    if err then
+      return callback(nil, 'Could not resolve the current commit: ' .. err)
+    end
+    local lines = vim.split(stdout, '\n', { plain = true })
+    local sha = lines[1]
+    if not valid_oid(sha) then
+      return callback(nil, 'Current commit metadata is incomplete')
+    end
+    local parents = lines[2] or ''
+    local commit = {
+      sha = sha,
+      parent = parents:match('^(%S+)'),
+      title = lines[3] or '',
+    }
+    M.discover(root, function(discovered, discovery_err)
+      if discovery_err then
+        return callback(nil, discovery_err)
+      end
+      if discovered.pr.headRefOid ~= commit.sha then
+        return callback(nil, 'Local HEAD does not match the current pull request head')
+      end
+      discovered.kind = 'commit'
+      discovered.commit = commit
+      callback(discovered)
+    end)
+  end)
+end
+
 local function fetch_snapshot(current, attempt, on_stage, callback)
   on_stage('Fetching GitHub diff')
   local args = { 'gh', 'pr', 'diff', tostring(current.pr.number), '--repo', current.repo }
@@ -104,6 +163,9 @@ local function fetch_snapshot(current, attempt, on_stage, callback)
       if revision_matches(current, latest) then
         return callback({ identity = current, raw_diff = raw_diff })
       end
+      if current.kind == 'commit' then
+        return callback(nil, 'Pull request changed while fetching its diff; refresh local HEAD and try again.')
+      end
       local cached = M.get(latest)
       if cached then
         return callback({ cached = cached })
@@ -116,10 +178,96 @@ local function fetch_snapshot(current, attempt, on_stage, callback)
   end)
 end
 
+local function build_session(current, raw_diff, review_diff, meat_options, on_stage, callback)
+  on_stage('Running Meat')
+  local options = vim.tbl_extend('force', meat_options or {}, {
+    cwd = current.root,
+    stdin = raw_diff,
+  })
+  process.run({ 'meat', '-json' }, options, function(meat_json, meat_err)
+    if meat_err then
+      return callback(nil, 'Meat failed: ' .. meat_err)
+    end
+    local meat, decode_err = process.decode(meat_json, 'Meat result')
+    if not meat then
+      return callback(nil, decode_err)
+    end
+    if type(meat.summary) ~= 'string' or type(meat.smart_diff) ~= 'string' or meat.elision == nil then
+      return callback(nil, 'Meat result is missing summary, elision, or smart_diff')
+    end
+
+    on_stage('Mapping review')
+    local ok, view = pcall(function()
+      local built = diff.build_view(raw_diff, meat.smart_diff)
+      if current.kind == 'commit' then
+        diff.map_review_locations(built, review_diff, current.commit.parent == current.pr.baseRefOid)
+      end
+      return built
+    end)
+    if not ok then
+      return callback(nil, 'Could not map Meat diff: ' .. process.concise_error(view))
+    end
+
+    local result = {
+      key = M.key(current),
+      kind = current.kind,
+      state = 'ready',
+      root = current.root,
+      raw_diff = raw_diff,
+      meat = meat,
+      view = view,
+      comments = {},
+      review_body = '',
+      review_event = 'COMMENT',
+    }
+    if current.kind == 'pr' then
+      result.repo = current.repo
+      result.pr = current.pr
+      result.base_sha = current.pr.baseRefOid
+      result.head_sha = current.pr.headRefOid
+    else
+      result.repo = current.repo
+      result.pr = current.pr
+      result.commit = current.commit
+      result.base_sha = current.commit.parent
+      result.head_sha = current.commit.sha
+    end
+    result.submission_base_sha = current.pr.baseRefOid
+    result.submission_head_sha = current.pr.headRefOid
+    cache[result.key] = result
+    callback(result)
+  end)
+end
+
+local function load_commit(discovered, review_diff, meat_options, on_stage, callback)
+  on_stage('Fetching commit diff')
+  local commit = discovered.commit
+  local args
+  if commit.parent then
+    args = { 'git', 'diff', '--no-ext-diff', commit.parent, commit.sha }
+  else
+    args = { 'git', 'show', '--format=', '--root', '--no-ext-diff', commit.sha }
+  end
+  process.run(args, { cwd = discovered.root }, function(raw_diff, err)
+    if err then
+      return callback(nil, 'Could not read the current commit diff: ' .. err)
+    end
+    build_session(discovered, raw_diff, review_diff, meat_options, on_stage, callback)
+  end)
+end
+
 function M.load(discovered, meat_options, on_stage, callback)
   local cached = M.get(discovered)
   if cached then
     return callback(cached)
+  end
+  if discovered.kind == 'commit' then
+    return fetch_snapshot(discovered, 1, on_stage, function(snapshot, snapshot_err)
+      if snapshot_err then
+        return callback(nil, snapshot_err)
+      end
+      load_commit(snapshot.identity, snapshot.raw_diff, meat_options, on_stage, callback)
+    end)
   end
 
   fetch_snapshot(discovered, 1, on_stage, function(snapshot, snapshot_err)
@@ -129,49 +277,7 @@ function M.load(discovered, meat_options, on_stage, callback)
     if snapshot.cached then
       return callback(snapshot.cached)
     end
-
-    local current = snapshot.identity
-    on_stage('Running Meat')
-    local options = vim.tbl_extend('force', meat_options or {}, {
-      cwd = current.root,
-      stdin = snapshot.raw_diff,
-    })
-    process.run({ 'meat', '-json' }, options, function(meat_json, meat_err)
-      if meat_err then
-        return callback(nil, 'Meat failed: ' .. meat_err)
-      end
-      local meat, decode_err = process.decode(meat_json, 'Meat result')
-      if not meat then
-        return callback(nil, decode_err)
-      end
-      if type(meat.summary) ~= 'string' or type(meat.smart_diff) ~= 'string' or meat.elision == nil then
-        return callback(nil, 'Meat result is missing summary, elision, or smart_diff')
-      end
-
-      on_stage('Mapping review')
-      local ok, view = pcall(diff.build_view, snapshot.raw_diff, meat.smart_diff)
-      if not ok then
-        return callback(nil, 'Could not map Meat diff: ' .. process.concise_error(view))
-      end
-
-      local result = {
-        key = M.key(current),
-        state = 'ready',
-        root = current.root,
-        repo = current.repo,
-        pr = current.pr,
-        raw_diff = snapshot.raw_diff,
-        meat = meat,
-        view = view,
-        base_sha = current.pr.baseRefOid,
-        head_sha = current.pr.headRefOid,
-        comments = {},
-        review_body = '',
-        review_event = 'COMMENT',
-      }
-      cache[result.key] = result
-      callback(result)
-    end)
+    build_session(snapshot.identity, snapshot.raw_diff, snapshot.raw_diff, meat_options, on_stage, callback)
   end)
 end
 

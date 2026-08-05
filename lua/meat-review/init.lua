@@ -1,5 +1,6 @@
 local M = {}
 
+local diff = require('meat-review.diff')
 local process = require('meat-review.process')
 local sessions = require('meat-review.sessions')
 local run = process.run
@@ -14,9 +15,32 @@ vim.api.nvim_set_hl(0, 'MeatReviewDraftText', { default = true, link = 'Normal' 
 
 local session = { state = 'idle', comments = {} }
 local checking_identity = false
+local config = {}
 
 local function notify(message, level)
   vim.notify(message, level or vim.log.levels.INFO, { title = 'Meat Review' })
+end
+
+local function short_sha(sha)
+  return sha:sub(1, 12)
+end
+
+local function session_label(target)
+  if target.kind == 'commit' then
+    return 'commit ' .. short_sha(target.commit.sha)
+  end
+  return ('PR #%d'):format(target.pr.number)
+end
+
+local function open_command(target)
+  return target.kind == 'commit' and ':MeatReviewCommit' or ':MeatReview'
+end
+
+function M.setup(options)
+  options = options or {}
+  assert(type(options) == 'table', 'meat-review setup options must be a table')
+  assert(options.open_file == nil or type(options.open_file) == 'function', 'open_file must be a function')
+  config.open_file = options.open_file
 end
 
 local function fail_review(target, message)
@@ -78,7 +102,7 @@ local function edit_comment(target)
   if not location then
     local text = target.view.lines[source_line] or ''
     local reason = text:sub(1, 1) == ' ' and 'Context lines cannot be annotated.'
-      or 'This is not an exact retained changed line with a safe GitHub location.'
+      or 'This is not an exact retained changed line with a safe review location.'
     return notify(reason, vim.log.levels.WARN)
   end
 
@@ -176,14 +200,27 @@ local function navigate_comments(target, direction)
 end
 
 local function add_header(target, buf)
-  local pr, meat = target.pr, target.meat
-  local virtual = {
-    { { ('PR #%d — %s'):format(pr.number, pr.title), 'Title' } },
-    { { pr.url, 'Underlined' } },
-    { { ('%s ← %s'):format(pr.baseRefName, pr.headRefName), 'Comment' } },
-    { { 'Meat: ' .. meat.summary, 'Comment' } },
-    { { 'Elision: ' .. tostring(meat.elision), 'Comment' } },
-  }
+  local virtual
+  if target.kind == 'commit' then
+    local commit = target.commit
+    local relation = commit.parent and ('%s ← %s'):format(short_sha(commit.parent), short_sha(commit.sha))
+      or 'Root commit'
+    virtual = {
+      { { ('Commit %s — %s'):format(short_sha(commit.sha), commit.title), 'Title' } },
+      { { commit.sha, 'Underlined' } },
+      { { relation, 'Comment' } },
+      { { ('Submission target: PR #%d — %s'):format(target.pr.number, target.pr.title), 'Comment' } },
+    }
+  else
+    local pr = target.pr
+    virtual = {
+      { { ('PR #%d — %s'):format(pr.number, pr.title), 'Title' } },
+      { { pr.url, 'Underlined' } },
+      { { ('%s ← %s'):format(pr.baseRefName, pr.headRefName), 'Comment' } },
+    }
+  end
+  virtual[#virtual + 1] = { { 'Meat: ' .. target.meat.summary, 'Comment' } }
+  virtual[#virtual + 1] = { { 'Elision: ' .. tostring(target.meat.elision), 'Comment' } }
   if target.view.unmapped_count > 0 then
     virtual[#virtual + 1] = {
       { ('Warning: %d changed Meat row(s) could not be mapped.'):format(target.view.unmapped_count), 'WarningMsg' },
@@ -193,8 +230,8 @@ local function add_header(target, buf)
   vim.api.nvim_buf_set_extmark(buf, review_ns, 0, 0, { virt_lines = virtual, virt_lines_above = true })
 end
 
-local function highlight_view(target, buf)
-  for index, text in ipairs(target.view.lines) do
+local function highlight_diff(buf, lines)
+  for index, text in ipairs(lines) do
     local group
     if text:match('^── ') then
       group = 'Title'
@@ -213,6 +250,79 @@ local function highlight_view(target, buf)
   end
 end
 
+local function file_under_cursor(target)
+  if target.state ~= 'open' or vim.api.nvim_get_current_buf() ~= target.buf then
+    return nil, 'Open a Meat review and place the cursor inside a file first.'
+  end
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local file
+  for _, file_line in ipairs(target.view.files) do
+    if file_line > cursor_line then
+      break
+    end
+    file = target.view.file_contexts[file_line]
+  end
+  if not file or not file.supported or not file.path then
+    return nil, 'The current file does not have a supported Git path.'
+  end
+  local source_locations = target.view.source_locations or target.view.locations
+  local location = source_locations[cursor_line]
+  return {
+    root = target.root,
+    path = file.path,
+    old_path = file.old_path,
+    new_path = file.new_path,
+    line = location and location.line or nil,
+    side = location and location.side or nil,
+    kind = target.kind,
+    base_sha = target.base_sha,
+    head_sha = target.head_sha,
+  }
+end
+
+local function open_file_diff(target, context)
+  local lines = diff.file_lines(target.raw_diff, context.path)
+  if not lines then
+    return notify('Could not recover the full diff for the current file.', vim.log.levels.ERROR)
+  end
+  vim.cmd('vsplit')
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(win, buf)
+  vim.bo[buf].buftype = 'nofile'
+  vim.bo[buf].bufhidden = 'wipe'
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  vim.bo[buf].filetype = 'diff'
+  local name = ('meat-review://file/%s/%s/%s'):format(short_sha(target.head_sha), context.path, vim.uv.hrtime())
+  vim.api.nvim_buf_set_name(buf, name)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.wo[win].wrap = false
+  highlight_diff(buf, lines)
+  vim.keymap.set('n', 'q', function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end, { buffer = buf, nowait = true, silent = true, desc = 'Close full file diff' })
+end
+
+function M.open_file(selected)
+  local target = selected or session
+  local context, err = file_under_cursor(target)
+  if err then
+    return notify(err, vim.log.levels.WARN)
+  end
+  if config.open_file then
+    local ok, opener_err = pcall(config.open_file, context)
+    if not ok then
+      notify('Configured file opener failed: ' .. process.concise_error(opener_err), vim.log.levels.ERROR)
+    end
+    return
+  end
+  open_file_diff(target, context)
+end
+
 local function close_tab()
   vim.cmd('tabclose')
 end
@@ -227,7 +337,7 @@ local function open_review(target)
   vim.bo[buf].swapfile = false
   vim.bo[buf].modifiable = true
   vim.bo[buf].filetype = 'diff'
-  vim.api.nvim_buf_set_name(buf, ('Meat Review PR #%d'):format(target.pr.number))
+  vim.api.nvim_buf_set_name(buf, 'Meat Review ' .. session_label(target))
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, target.view.lines)
   vim.bo[buf].modifiable = false
   vim.wo[win].wrap = false
@@ -235,7 +345,7 @@ local function open_review(target)
   target.buf, target.win, target.state = buf, win, 'open'
 
   add_header(target, buf)
-  highlight_view(target, buf)
+  highlight_diff(buf, target.view.lines)
   refresh_comments(target)
 
   local map = function(lhs, rhs, description)
@@ -259,6 +369,9 @@ local function open_review(target)
   map(']f', function()
     navigate(vim.deepcopy(target.view.files), 1)
   end, 'Next file')
+  map('o', function()
+    M.open_file(target)
+  end, 'Open full file diff')
   map('S', function()
     M.submit(target)
   end, 'Preview review submission')
@@ -330,18 +443,20 @@ local function select_discovered(identity, announced_start)
     local changed = cached ~= session
     activate(cached)
     if changed then
-      notify(('Restored cached Meat review for PR #%d'):format(cached.pr.number))
+      notify('Restored cached Meat review for ' .. session_label(cached))
     end
     return show_session(cached)
   end
 
   local target = {
+    kind = identity.kind,
     state = 'running',
     stage = 'Fetching GitHub diff',
     started_at = vim.uv.hrtime(),
     root = identity.root,
     repo = identity.repo,
     pr = identity.pr,
+    commit = identity.commit,
     comments = {},
   }
   activate(target)
@@ -361,11 +476,11 @@ local function select_discovered(identity, announced_start)
     if session == target then
       session = resolved
     end
-    notify(('Meat review ready for PR #%d — run :MeatReview to open'):format(resolved.pr.number))
+    notify(('Meat review ready for %s — run %s to open'):format(session_label(resolved), open_command(resolved)))
   end)
 end
 
-function M.open()
+local function discover_review(discover, requires_gh)
   if checking_identity or session.state == 'running' or session.submitting then
     return notify('Meat review is still running…')
   end
@@ -380,14 +495,14 @@ function M.open()
       return discovery_failed('Could not resolve repository root: ' .. root_err)
     end
     root = root:gsub('%s+$', '')
-    if vim.fn.executable('gh') ~= 1 then
+    if requires_gh and vim.fn.executable('gh') ~= 1 then
       return discovery_failed('Required executable not found: gh')
     end
     if vim.fn.executable('meat') ~= 1 then
       return discovery_failed('Required executable not found: meat')
     end
 
-    sessions.discover(root, function(identity, err)
+    discover(root, function(identity, err)
       if err then
         return discovery_failed(err)
       end
@@ -396,18 +511,26 @@ function M.open()
   end)
 end
 
+function M.open()
+  discover_review(sessions.discover, true)
+end
+
+function M.open_commit()
+  discover_review(sessions.discover_commit, true)
+end
+
 function M.status()
   if checking_identity then
-    notify('Meat review: Discovering current pull request')
+    notify('Meat review: Discovering review target')
   elseif session.state == 'idle' then
     notify('No active Meat review.')
   elseif session.state == 'running' then
     local elapsed = math.floor((vim.uv.hrtime() - session.started_at) / 1e9)
     notify(('Meat review: %s (%ds elapsed)'):format(session.stage, elapsed))
   elseif session.state == 'ready' then
-    notify(('Meat review ready for PR #%d — run :MeatReview to open'):format(session.pr.number))
+    notify(('Meat review ready for %s — run %s to open'):format(session_label(session), open_command(session)))
   elseif session.state == 'open' then
-    notify(('Meat review open for PR #%d'):format(session.pr.number))
+    notify('Meat review open for ' .. session_label(session))
   end
 end
 
@@ -445,7 +568,7 @@ local function submit_review(target, drafts, review_body, review_event, preview_
       target.submitting = false
       return notify(decode_err, vim.log.levels.ERROR)
     end
-    if current.baseRefOid ~= target.base_sha or current.headRefOid ~= target.head_sha then
+    if current.baseRefOid ~= target.submission_base_sha or current.headRefOid ~= target.submission_head_sha then
       target.submitting = false
       return notify('PR revision changed since this review started; start a new Meat review.', vim.log.levels.ERROR)
     end
@@ -460,7 +583,7 @@ local function submit_review(target, drafts, review_body, review_event, preview_
       }
     end
     local payload = vim.json.encode({
-      commit_id = target.head_sha,
+      commit_id = target.submission_head_sha,
       body = review_body,
       event = review_event,
       comments = comments,

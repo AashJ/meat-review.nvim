@@ -15,7 +15,14 @@ function M.run(args, options, callback)
   vim.system(args, options or {}, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
-        callback(nil, M.concise_error(result.stderr))
+        local details = {}
+        if result.stderr and result.stderr ~= '' then
+          details[#details + 1] = result.stderr
+        end
+        if result.stdout and result.stdout ~= '' then
+          details[#details + 1] = result.stdout
+        end
+        callback(nil, M.concise_error(table.concat(details, '\n')))
       else
         callback(result.stdout or '', nil)
       end
