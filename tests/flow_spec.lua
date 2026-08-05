@@ -11,13 +11,37 @@ local raw_diff = table.concat({
 local expected = {
   { 'git', 'rev-parse', '--show-toplevel' },
   { 'gh', 'repo', 'view', '--json', 'nameWithOwner' },
-  { 'gh', 'pr', 'view', '--json', 'number,url,title,state,baseRefName,headRefName,headRefOid' },
-  { 'gh', 'pr', 'diff', '42' },
+  {
+    'gh',
+    'pr',
+    'view',
+    '--json',
+    'number,url,title,state,baseRefName,baseRefOid,headRefName,headRefOid',
+  },
+  { 'gh', 'pr', 'diff', '42', '--repo', 'owner/repo' },
+  {
+    'gh',
+    'pr',
+    'view',
+    '42',
+    '--repo',
+    'owner/repo',
+    '--json',
+    'number,url,title,state,baseRefName,baseRefOid,headRefName,headRefOid',
+  },
   { 'meat', '-json' },
 }
 
 local calls, notifications, pending, pending_meat, scheduled = {}, {}, nil, nil, 0
-local current_pr = { number = 42, head = 'abc123', branch = 'feature', title = 'Example PR' }
+local advance_after_diff
+local current_pr = {
+  number = 42,
+  base = 'base123',
+  base_branch = 'release',
+  head = 'abc123',
+  branch = 'feature',
+  title = 'Example PR',
+}
 local meat_calls = 0
 vim.env.MEAT_OPENAI_API_KEY = 'plugin-scoped-test-key'
 vim.env.OPENAI_API_KEY = nil
@@ -33,8 +57,6 @@ vim.system = function(args, options, callback)
   local response
   if vim.deep_equal(args, { 'git', 'rev-parse', '--show-toplevel' }) then
     response = { stdout = '/tmp/example\n' }
-  elseif vim.deep_equal(args, { 'git', 'status', '--porcelain=v2', '--branch', '--untracked-files=no' }) then
-    response = { stdout = ('# branch.oid %s\n# branch.head %s\n'):format(current_pr.head, current_pr.branch) }
   elseif vim.deep_equal(args, { 'gh', 'repo', 'view', '--json', 'nameWithOwner' }) then
     response = { stdout = '{"nameWithOwner":"owner/repo"}' }
   elseif args[1] == 'gh' and args[2] == 'pr' and args[3] == 'view' then
@@ -44,13 +66,18 @@ vim.system = function(args, options, callback)
         url = ('https://github.com/owner/repo/pull/%d'):format(current_pr.number),
         title = current_pr.title,
         state = 'OPEN',
-        baseRefName = 'release',
+        baseRefName = current_pr.base_branch,
+        baseRefOid = current_pr.base,
         headRefName = current_pr.branch,
         headRefOid = current_pr.head,
       }),
     }
   elseif args[1] == 'gh' and args[2] == 'pr' and args[3] == 'diff' then
     response = { stdout = raw_diff }
+    if advance_after_diff then
+      current_pr.head = advance_after_diff
+      advance_after_diff = nil
+    end
   elseif vim.deep_equal(args, { 'meat', '-json' }) then
     meat_calls = meat_calls + 1
     response = { stdout = vim.json.encode({ summary = 'Small example.', elision = '0%', smart_diff = raw_diff }) }
@@ -96,7 +123,7 @@ assert(notifications[#notifications] == 'Meat review is still running…')
 assert(#calls == 1, 'a running review must not start another process')
 
 pending()
-assert(#calls == 5, 'the successful workflow should issue five commands')
+assert(#calls == 6, 'the successful workflow should issue six commands')
 review.status()
 assert(notifications[#notifications]:match('Meat review: Running Meat'))
 assert(vim.api.nvim_get_current_buf() == original_buf, 'running Meat must not open a review buffer')
@@ -104,8 +131,8 @@ assert(vim.api.nvim_get_current_buf() == original_buf, 'running Meat must not op
 pending_meat()
 assert(vim.api.nvim_get_current_buf() == original_buf, 'ready reviews must not open automatically')
 assert(notifications[#notifications]:match('ready for PR #42'), 'ready notification is missing')
-assert(calls[5].options.stdin == raw_diff, 'Meat must receive the exact GitHub diff bytes')
-assert(calls[5].options.env.OPENAI_API_KEY == 'plugin-scoped-test-key', 'Meat must receive the plugin-scoped API key')
+assert(calls[6].options.stdin == raw_diff, 'Meat must receive the exact GitHub diff bytes')
+assert(calls[6].options.env.OPENAI_API_KEY == 'plugin-scoped-test-key', 'Meat must receive the plugin-scoped API key')
 assert(vim.env.OPENAI_API_KEY == nil, 'the plugin-scoped key must not become a general Neovim environment variable')
 
 for index, command in ipairs(expected) do
@@ -114,7 +141,7 @@ for index, command in ipairs(expected) do
     ('command %d did not use the expected argument array'):format(index)
   )
 end
-assert(scheduled == 5, 'every process callback must enter vim.schedule')
+assert(scheduled == 6, 'every process callback must enter vim.schedule')
 
 review.open()
 local review_buf = vim.api.nvim_get_current_buf()
@@ -209,25 +236,82 @@ local reopened_marks =
   vim.api.nvim_buf_get_extmarks(reopened_buf, namespaces['meat-review-comments'], 0, -1, { details = true })
 assert(#reopened_marks == 1, 'drafts should survive closing and reopening the review buffer')
 
-current_pr = { number = 43, head = 'def456', branch = 'next-feature', title = 'Next PR' }
+current_pr = {
+  number = 43,
+  base = 'base123',
+  base_branch = 'release',
+  head = 'def456',
+  branch = 'next-feature',
+  title = 'Next PR',
+}
 review.open()
 assert(notifications[#notifications]:match('ready for PR #43'), 'switching branches should start the current PR review')
 review.open()
 local next_buf = vim.api.nvim_get_current_buf()
 assert(vim.api.nvim_buf_get_name(next_buf):match('PR #43'), 'the new branch should open its own review')
 
-current_pr = { number = 43, head = 'ghi789', branch = 'next-feature', title = 'Next PR' }
+current_pr.head = 'ghi789'
 review.open()
 assert(meat_calls == 3, 'a new head SHA on the same PR must create a fresh review revision')
 assert(notifications[#notifications]:match('ready for PR #43'))
 
-current_pr = { number = 42, head = 'abc123', branch = 'feature', title = 'Example PR' }
+current_pr.base = 'base456'
+review.open()
+assert(meat_calls == 4, 'a new base SHA on the same PR must create a fresh review revision')
+assert(notifications[#notifications]:match('ready for PR #43'))
+
+current_pr = {
+  number = 44,
+  base = 'base789',
+  base_branch = 'release',
+  head = 'race-before',
+  branch = 'racing-feature',
+  title = 'Racing PR',
+}
+advance_after_diff = 'race-after'
+local calls_before_race = #calls
+review.open()
+local race_diff_calls = 0
+for index = calls_before_race + 1, #calls do
+  local args = calls[index].args
+  if args[1] == 'gh' and args[2] == 'pr' and args[3] == 'diff' then
+    race_diff_calls = race_diff_calls + 1
+  end
+end
+assert(race_diff_calls == 2, 'a PR update during diff retrieval must retry the snapshot')
+assert(meat_calls == 5, 'only the validated snapshot should be sent to Meat')
+
+current_pr = {
+  number = 42,
+  base = 'base123',
+  base_branch = 'release',
+  head = 'abc123',
+  branch = 'feature',
+  title = 'Example PR',
+}
 review.open()
 local restored_buf = vim.api.nvim_get_current_buf()
 assert(vim.api.nvim_buf_get_name(restored_buf):match('PR #42'), 'returning to a branch should restore its exact review')
 local restored_marks =
   vim.api.nvim_buf_get_extmarks(restored_buf, namespaces['meat-review-comments'], 0, -1, { details = true })
 assert(#restored_marks == 1, 'restoring a cached review should restore its drafts')
-assert(meat_calls == 3, 'returning to an exact cached revision must not run Meat again')
+assert(meat_calls == 5, 'returning to an exact cached revision must not run Meat again')
+
+mapping(restored_buf, 'n', 'S')()
+local stale_preview_buf = vim.api.nvim_get_current_buf()
+current_pr.base = 'base-changed-before-submit'
+vim.ui.select = function(items, _, callback)
+  callback(items[2])
+end
+local calls_before_stale_submit = #calls
+mapping(stale_preview_buf, 'n', 'S')()
+assert(
+  notifications[#notifications]:match('PR revision changed'),
+  'submission must reject a review whose base revision changed'
+)
+for index = calls_before_stale_submit + 1, #calls do
+  local args = calls[index].args
+  assert(not (args[1] == 'gh' and args[2] == 'api'), 'a stale review must not reach the GitHub review API')
+end
 
 print('flow test passed')

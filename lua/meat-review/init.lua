@@ -1,6 +1,9 @@
 local M = {}
 
-local diff = require('meat-review.diff')
+local process = require('meat-review.process')
+local sessions = require('meat-review.sessions')
+local run = process.run
+local decode = process.decode
 local review_ns = vim.api.nvim_create_namespace('meat-review')
 local comment_ns = vim.api.nvim_create_namespace('meat-review-comments')
 local preview_ns = vim.api.nvim_create_namespace('meat-review-preview')
@@ -9,7 +12,6 @@ vim.api.nvim_set_hl(0, 'MeatReviewDraftRail', { default = true, link = 'Comment'
 vim.api.nvim_set_hl(0, 'MeatReviewDraftLabel', { default = true, link = 'DiagnosticInfo' })
 vim.api.nvim_set_hl(0, 'MeatReviewDraftText', { default = true, link = 'Normal' })
 
-local sessions = {}
 local session = { state = 'idle', comments = {} }
 local checking_identity = false
 
@@ -17,117 +19,11 @@ local function notify(message, level)
   vim.notify(message, level or vim.log.levels.INFO, { title = 'Meat Review' })
 end
 
-local function concise_error(stderr)
-  local message = (stderr or ''):gsub('^%s+', ''):gsub('%s+$', ''):gsub('%s+', ' ')
-  if message == '' then
-    return 'command failed without an error message'
-  end
-  if #message > 500 then
-    return message:sub(1, 497) .. '...'
-  end
-  return message
-end
-
-local function run(args, options, callback)
-  vim.system(args, options or {}, function(result)
-    vim.schedule(function()
-      if result.code ~= 0 then
-        callback(nil, concise_error(result.stderr))
-      else
-        callback(result.stdout or '', nil)
-      end
-    end)
-  end)
-end
-
-local function decode(value, label)
-  local ok, decoded = pcall(vim.json.decode, value)
-  if not ok or type(decoded) ~= 'table' then
-    return nil, ('invalid %s JSON'):format(label)
-  end
-  return decoded
-end
-
-local function session_key(repo, pr)
-  return table.concat({ repo, tostring(pr.number), pr.headRefOid }, '\0')
-end
-
 local function fail_review(target, message)
-  sessions[target.key] = nil
   if session == target then
     session = { state = 'idle', comments = {} }
   end
   notify(message, vim.log.levels.ERROR)
-end
-
-local function process_review(target)
-  target.stage = 'Fetching GitHub diff'
-  run({ 'gh', 'pr', 'diff', tostring(target.pr.number) }, { cwd = target.root }, function(raw_diff, diff_err)
-    if diff_err then
-      return fail_review(target, 'Could not fetch PR diff: ' .. diff_err)
-    end
-    local meat_options = { cwd = target.root, stdin = raw_diff }
-    if vim.env.MEAT_OPENAI_API_KEY and vim.env.MEAT_OPENAI_API_KEY ~= '' then
-      meat_options.env = { OPENAI_API_KEY = vim.env.MEAT_OPENAI_API_KEY }
-    end
-    target.stage = 'Running Meat'
-    run({ 'meat', '-json' }, meat_options, function(meat_json, meat_err)
-      if meat_err then
-        return fail_review(target, 'Meat failed: ' .. meat_err)
-      end
-      local meat, meat_decode_err = decode(meat_json, 'Meat result')
-      if not meat then
-        return fail_review(target, meat_decode_err)
-      end
-      if type(meat.summary) ~= 'string' or type(meat.smart_diff) ~= 'string' or meat.elision == nil then
-        return fail_review(target, 'Meat result is missing summary, elision, or smart_diff')
-      end
-      target.stage = 'Mapping review'
-      local ok, view = pcall(diff.build_view, raw_diff, meat.smart_diff)
-      if not ok then
-        return fail_review(target, 'Could not map Meat diff: ' .. concise_error(view))
-      end
-
-      target.state = 'ready'
-      target.raw_diff = raw_diff
-      target.meat = meat
-      target.view = view
-      notify(('Meat review ready for PR #%d — run :MeatReview to open'):format(target.pr.number))
-    end)
-  end)
-end
-
-local function discover_pr(root, callback)
-  run({ 'gh', 'repo', 'view', '--json', 'nameWithOwner' }, { cwd = root }, function(repo_json, repo_err)
-    if repo_err then
-      return callback(nil, 'Could not identify GitHub repository: ' .. repo_err)
-    end
-    local repo, repo_decode_err = decode(repo_json, 'repository')
-    if not repo then
-      return callback(nil, repo_decode_err)
-    end
-    if type(repo.nameWithOwner) ~= 'string' or not repo.nameWithOwner:match('^[^/]+/[^/]+$') then
-      return callback(nil, 'GitHub repository identity is missing or unsupported')
-    end
-
-    local fields = 'number,url,title,state,baseRefName,headRefName,headRefOid'
-    run({ 'gh', 'pr', 'view', '--json', fields }, { cwd = root }, function(pr_json, pr_err)
-      if pr_err then
-        return callback(nil, 'Could not find a pull request for the current branch: ' .. pr_err)
-      end
-      local pr, pr_decode_err = decode(pr_json, 'pull request')
-      if not pr then
-        return callback(nil, pr_decode_err)
-      end
-      if pr.state ~= 'OPEN' then
-        return callback(nil, 'The current branch does not have an open pull request')
-      end
-      if type(pr.number) ~= 'number' or type(pr.headRefOid) ~= 'string' then
-        return callback(nil, 'Pull request metadata is incomplete')
-      end
-      callback({ root = root, repo = repo.nameWithOwner, pr = pr })
-    end)
-  end)
 end
 
 local function comment_key(location)
@@ -139,13 +35,13 @@ local function split_body(body)
   return #lines > 0 and lines or { '' }
 end
 
-local function refresh_comments()
-  if not session.buf or not vim.api.nvim_buf_is_valid(session.buf) then
+local function refresh_comments(target)
+  if not target.buf or not vim.api.nvim_buf_is_valid(target.buf) then
     return
   end
-  vim.api.nvim_buf_clear_namespace(session.buf, comment_ns, 0, -1)
-  for line, location in pairs(session.view.locations) do
-    local draft = session.comments[comment_key(location)]
+  vim.api.nvim_buf_clear_namespace(target.buf, comment_ns, 0, -1)
+  for line, location in pairs(target.view.locations) do
+    local draft = target.comments[comment_key(location)]
     if draft then
       local virtual = {
         { { '  │ ', 'MeatReviewDraftRail' }, { 'Draft comment', 'MeatReviewDraftLabel' } },
@@ -156,7 +52,7 @@ local function refresh_comments()
           { body_line, 'MeatReviewDraftText' },
         }
       end
-      vim.api.nvim_buf_set_extmark(session.buf, comment_ns, line - 1, 0, {
+      vim.api.nvim_buf_set_extmark(target.buf, comment_ns, line - 1, 0, {
         sign_text = '●',
         sign_hl_group = 'DiagnosticInfo',
         virt_lines = virtual,
@@ -176,18 +72,18 @@ local function normalize_body(lines)
   return table.concat(lines, '\n')
 end
 
-local function edit_comment()
+local function edit_comment(target)
   local source_line = vim.api.nvim_win_get_cursor(0)[1]
-  local location = session.view.locations[source_line]
+  local location = target.view.locations[source_line]
   if not location then
-    local text = session.view.lines[source_line] or ''
+    local text = target.view.lines[source_line] or ''
     local reason = text:sub(1, 1) == ' ' and 'Context lines cannot be annotated.'
       or 'This is not an exact retained changed line with a safe GitHub location.'
     return notify(reason, vim.log.levels.WARN)
   end
 
   local key = comment_key(location)
-  local existing = session.comments[key]
+  local existing = target.comments[key]
   local buf = vim.api.nvim_create_buf(false, true)
   local width = math.max(30, math.min(80, vim.o.columns - 8))
   local height = math.max(5, math.min(12, vim.o.lines - 8))
@@ -213,15 +109,15 @@ local function edit_comment()
   local function save()
     local body = normalize_body(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
     if body == '' then
-      session.comments[key] = nil
+      target.comments[key] = nil
     else
-      session.comments[key] = { location = vim.deepcopy(location), body = body }
+      target.comments[key] = { location = vim.deepcopy(location), body = body }
     end
     vim.bo[buf].modified = false
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
-    refresh_comments()
+    refresh_comments(target)
   end
 
   vim.api.nvim_create_autocmd('BufWriteCmd', {
@@ -237,13 +133,13 @@ local function edit_comment()
   vim.keymap.set({ 'n', 'i' }, '<C-s>', save, { buffer = buf })
 end
 
-local function delete_comment()
-  local location = session.view.locations[vim.api.nvim_win_get_cursor(0)[1]]
-  if not location or not session.comments[comment_key(location)] then
+local function delete_comment(target)
+  local location = target.view.locations[vim.api.nvim_win_get_cursor(0)[1]]
+  if not location or not target.comments[comment_key(location)] then
     return notify('There is no draft comment on this line.', vim.log.levels.WARN)
   end
-  session.comments[comment_key(location)] = nil
-  refresh_comments()
+  target.comments[comment_key(location)] = nil
+  refresh_comments(target)
 end
 
 local function navigate(lines, direction)
@@ -269,18 +165,18 @@ local function navigate(lines, direction)
   end
 end
 
-local function navigate_comments(direction)
+local function navigate_comments(target, direction)
   local lines = {}
-  for line, location in pairs(session.view.locations) do
-    if session.comments[comment_key(location)] then
+  for line, location in pairs(target.view.locations) do
+    if target.comments[comment_key(location)] then
       lines[#lines + 1] = line
     end
   end
   navigate(lines, direction)
 end
 
-local function add_header(buf)
-  local pr, meat = session.pr, session.meat
+local function add_header(target, buf)
+  local pr, meat = target.pr, target.meat
   local virtual = {
     { { ('PR #%d — %s'):format(pr.number, pr.title), 'Title' } },
     { { pr.url, 'Underlined' } },
@@ -288,17 +184,17 @@ local function add_header(buf)
     { { 'Meat: ' .. meat.summary, 'Comment' } },
     { { 'Elision: ' .. tostring(meat.elision), 'Comment' } },
   }
-  if session.view.unmapped_count > 0 then
+  if target.view.unmapped_count > 0 then
     virtual[#virtual + 1] = {
-      { ('Warning: %d changed Meat row(s) could not be mapped.'):format(session.view.unmapped_count), 'WarningMsg' },
+      { ('Warning: %d changed Meat row(s) could not be mapped.'):format(target.view.unmapped_count), 'WarningMsg' },
     }
   end
   virtual[#virtual + 1] = { { '' } }
   vim.api.nvim_buf_set_extmark(buf, review_ns, 0, 0, { virt_lines = virtual, virt_lines_above = true })
 end
 
-local function highlight_view(buf)
-  for index, text in ipairs(session.view.lines) do
+local function highlight_view(target, buf)
+  for index, text in ipairs(target.view.lines) do
     local group
     if text:match('^── ') then
       group = 'Title'
@@ -321,8 +217,7 @@ local function close_tab()
   vim.cmd('tabclose')
 end
 
-local function open_review()
-  local review_session = session
+local function open_review(target)
   vim.cmd('tabnew')
   local win = vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_create_buf(false, true)
@@ -332,43 +227,49 @@ local function open_review()
   vim.bo[buf].swapfile = false
   vim.bo[buf].modifiable = true
   vim.bo[buf].filetype = 'diff'
-  vim.api.nvim_buf_set_name(buf, ('Meat Review PR #%d'):format(review_session.pr.number))
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, review_session.view.lines)
+  vim.api.nvim_buf_set_name(buf, ('Meat Review PR #%d'):format(target.pr.number))
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, target.view.lines)
   vim.bo[buf].modifiable = false
   vim.wo[win].wrap = false
   vim.wo[win].signcolumn = 'yes'
-  review_session.buf, review_session.win, review_session.state = buf, win, 'open'
+  target.buf, target.win, target.state = buf, win, 'open'
 
-  add_header(buf)
-  highlight_view(buf)
-  refresh_comments()
+  add_header(target, buf)
+  highlight_view(target, buf)
+  refresh_comments(target)
 
   local map = function(lhs, rhs, description)
     vim.keymap.set('n', lhs, rhs, { buffer = buf, nowait = true, silent = true, desc = description })
   end
-  map('a', edit_comment, 'Add or edit review comment')
-  map('d', delete_comment, 'Delete review comment')
+  map('a', function()
+    edit_comment(target)
+  end, 'Add or edit review comment')
+  map('d', function()
+    delete_comment(target)
+  end, 'Delete review comment')
   map('[c', function()
-    navigate_comments(-1)
+    navigate_comments(target, -1)
   end, 'Previous draft comment')
   map(']c', function()
-    navigate_comments(1)
+    navigate_comments(target, 1)
   end, 'Next draft comment')
   map('[f', function()
-    navigate(vim.deepcopy(session.view.files), -1)
+    navigate(vim.deepcopy(target.view.files), -1)
   end, 'Previous file')
   map(']f', function()
-    navigate(vim.deepcopy(session.view.files), 1)
+    navigate(vim.deepcopy(target.view.files), 1)
   end, 'Next file')
-  map('S', M.submit, 'Preview review submission')
+  map('S', function()
+    M.submit(target)
+  end, 'Preview review submission')
   map('q', close_tab, 'Close review tab')
 
   vim.api.nvim_create_autocmd('BufWipeout', {
     buffer = buf,
     once = true,
     callback = function()
-      if review_session.buf == buf then
-        review_session.buf, review_session.win, review_session.state = nil, nil, 'ready'
+      if target.buf == buf then
+        target.buf, target.win, target.state = nil, nil, 'ready'
       end
     end,
   })
@@ -403,16 +304,16 @@ local function activate(target)
   end
 end
 
-local function show_active()
-  if session.state == 'ready' then
-    open_review()
-  elseif session.state == 'open' then
-    if session.win and vim.api.nvim_win_is_valid(session.win) then
-      vim.api.nvim_set_current_tabpage(vim.api.nvim_win_get_tabpage(session.win))
-      vim.api.nvim_set_current_win(session.win)
+local function show_session(target)
+  if target.state == 'ready' then
+    open_review(target)
+  elseif target.state == 'open' then
+    if target.win and vim.api.nvim_win_is_valid(target.win) then
+      vim.api.nvim_set_current_tabpage(vim.api.nvim_win_get_tabpage(target.win))
+      vim.api.nvim_set_current_win(target.win)
     else
-      session.state = 'ready'
-      open_review()
+      target.state = 'ready'
+      open_review(target)
     end
   end
 end
@@ -424,36 +325,44 @@ end
 
 local function select_discovered(identity, announced_start)
   checking_identity = false
-  local key = session_key(identity.repo, identity.pr)
-  local cached = sessions[key]
+  local cached = sessions.get(identity)
   if cached then
     local changed = cached ~= session
     activate(cached)
     if changed then
       notify(('Restored cached Meat review for PR #%d'):format(cached.pr.number))
     end
-    return show_active()
+    return show_session(cached)
   end
 
   local target = {
-    key = key,
     state = 'running',
     stage = 'Fetching GitHub diff',
     started_at = vim.uv.hrtime(),
     root = identity.root,
     repo = identity.repo,
     pr = identity.pr,
-    head_sha = identity.pr.headRefOid,
     comments = {},
-    review_body = '',
-    review_event = 'COMMENT',
   }
   activate(target)
-  sessions[key] = target
   if not announced_start then
     notify('Starting Meat review…')
   end
-  process_review(target)
+  local meat_options = {}
+  if vim.env.MEAT_OPENAI_API_KEY and vim.env.MEAT_OPENAI_API_KEY ~= '' then
+    meat_options.env = { OPENAI_API_KEY = vim.env.MEAT_OPENAI_API_KEY }
+  end
+  sessions.load(identity, meat_options, function(stage)
+    target.stage = stage
+  end, function(resolved, err)
+    if err then
+      return fail_review(target, err)
+    end
+    if session == target then
+      session = resolved
+    end
+    notify(('Meat review ready for PR #%d — run :MeatReview to open'):format(resolved.pr.number))
+  end)
 end
 
 function M.open()
@@ -478,30 +387,11 @@ function M.open()
       return discovery_failed('Required executable not found: meat')
     end
 
-    local function discover()
-      discover_pr(root, function(identity, err)
-        if err then
-          return discovery_failed(err)
-        end
-        select_discovered(identity, announced_start)
-      end)
-    end
-
-    if session.state == 'idle' or session.root ~= root then
-      return discover()
-    end
-    local identity_args = { 'git', 'status', '--porcelain=v2', '--branch', '--untracked-files=no' }
-    run(identity_args, { cwd = root }, function(stdout, local_err)
-      if local_err then
-        return discover()
+    sessions.discover(root, function(identity, err)
+      if err then
+        return discovery_failed(err)
       end
-      local local_head = stdout:match('# branch%.oid ([^\n]+)')
-      local local_branch = stdout:match('# branch%.head ([^\n]+)')
-      if local_head == session.head_sha and local_branch == session.pr.headRefName then
-        checking_identity = false
-        return show_active()
-      end
-      discover()
+      select_discovered(identity, announced_start)
     end)
   end)
 end
@@ -521,9 +411,9 @@ function M.status()
   end
 end
 
-local function sorted_drafts()
+local function sorted_drafts(target)
   local drafts = {}
-  for _, draft in pairs(session.comments) do
+  for _, draft in pairs(target.comments) do
     drafts[#drafts + 1] = draft
   end
   table.sort(drafts, function(a, b)
@@ -538,24 +428,26 @@ local function sorted_drafts()
   return drafts
 end
 
-local function submit_review(drafts, review_body, review_event, preview_win)
-  if session.submitting then
+local function submit_review(target, drafts, review_body, review_event, preview_win)
+  if target.submitting then
     return notify('Review submission is already running…')
   end
-  session.submitting = true
-  run({ 'gh', 'pr', 'view', '--json', 'headRefOid' }, { cwd = session.root }, function(stdout, err)
+  target.submitting = true
+  local revision_fields = 'baseRefOid,headRefOid'
+  local args = { 'gh', 'pr', 'view', tostring(target.pr.number), '--repo', target.repo, '--json', revision_fields }
+  run(args, { cwd = target.root }, function(stdout, err)
     if err then
-      session.submitting = false
-      return notify('Could not refresh PR head: ' .. err, vim.log.levels.ERROR)
+      target.submitting = false
+      return notify('Could not refresh PR revision: ' .. err, vim.log.levels.ERROR)
     end
-    local current, decode_err = decode(stdout, 'pull request head')
+    local current, decode_err = decode(stdout, 'pull request revision')
     if not current then
-      session.submitting = false
+      target.submitting = false
       return notify(decode_err, vim.log.levels.ERROR)
     end
-    if current.headRefOid ~= session.head_sha then
-      session.submitting = false
-      return notify('PR head changed since this review started; start a new Meat review.', vim.log.levels.ERROR)
+    if current.baseRefOid ~= target.base_sha or current.headRefOid ~= target.head_sha then
+      target.submitting = false
+      return notify('PR revision changed since this review started; start a new Meat review.', vim.log.levels.ERROR)
     end
 
     local comments = {}
@@ -568,33 +460,33 @@ local function submit_review(drafts, review_body, review_event, preview_win)
       }
     end
     local payload = vim.json.encode({
-      commit_id = session.head_sha,
+      commit_id = target.head_sha,
       body = review_body,
       event = review_event,
       comments = comments,
     })
-    local endpoint = ('repos/%s/pulls/%d/reviews'):format(session.repo, session.pr.number)
+    local endpoint = ('repos/%s/pulls/%d/reviews'):format(target.repo, target.pr.number)
     run(
       { 'gh', 'api', '--method', 'POST', endpoint, '--input', '-' },
-      { cwd = session.root, stdin = payload },
+      { cwd = target.root, stdin = payload },
       function(body, api_err)
-        session.submitting = false
+        target.submitting = false
         if api_err then
           return notify('GitHub review submission failed: ' .. api_err, vim.log.levels.ERROR)
         end
         local response = decode(body, 'GitHub review response') or {}
         for _, draft in ipairs(drafts) do
           local key = comment_key(draft.location)
-          local current_draft = session.comments[key]
+          local current_draft = target.comments[key]
           if current_draft and current_draft.body == draft.body then
-            session.comments[key] = nil
+            target.comments[key] = nil
           end
         end
-        if session.review_body == review_body and session.review_event == review_event then
-          session.review_body = ''
-          session.review_event = 'COMMENT'
+        if target.review_body == review_body and target.review_event == review_event then
+          target.review_body = ''
+          target.review_event = 'COMMENT'
         end
-        refresh_comments()
+        refresh_comments(target)
         if preview_win and vim.api.nvim_win_is_valid(preview_win) then
           vim.api.nvim_win_close(preview_win, true)
         end
@@ -612,14 +504,14 @@ local event_descriptions = {
   REQUEST_CHANGES = 'Submit feedback suggesting changes.',
 }
 
-local function confirm_submission(drafts, review_body, review_event, preview_win)
+local function confirm_submission(target, drafts, review_body, review_event, preview_win)
   local action = 'Submit ' .. event_labels[review_event]
   vim.ui.select({ 'Cancel', action }, { prompt = action .. ' review to GitHub?' }, function(choice)
     if choice == action then
-      if not vim.deep_equal(drafts, sorted_drafts()) then
+      if not vim.deep_equal(drafts, sorted_drafts(target)) then
         return notify('Drafts changed after this preview was opened; open a fresh preview.', vim.log.levels.WARN)
       end
-      submit_review(drafts, review_body, review_event, preview_win)
+      submit_review(target, drafts, review_body, review_event, preview_win)
     end
   end)
 end
@@ -675,24 +567,25 @@ local function render_submission_editor(buf, review_event, drafts)
   vim.api.nvim_buf_set_extmark(buf, preview_ns, last_line, 0, { virt_lines = virtual, virt_lines_leftcol = true })
 end
 
-function M.submit()
-  if checking_identity or session.state == 'idle' or session.state == 'running' then
+function M.submit(selected)
+  local target = selected or session
+  if checking_identity or target.state == 'idle' or target.state == 'running' then
     return notify('No completed Meat review is available.', vim.log.levels.WARN)
   end
-  if session.preview_win and vim.api.nvim_win_is_valid(session.preview_win) then
-    vim.api.nvim_set_current_tabpage(vim.api.nvim_win_get_tabpage(session.preview_win))
-    return vim.api.nvim_set_current_win(session.preview_win)
+  if target.preview_win and vim.api.nvim_win_is_valid(target.preview_win) then
+    vim.api.nvim_set_current_tabpage(vim.api.nvim_win_get_tabpage(target.preview_win))
+    return vim.api.nvim_set_current_win(target.preview_win)
   end
 
-  if session.state == 'ready' then
-    open_review()
-  elseif session.win and vim.api.nvim_win_is_valid(session.win) then
-    vim.api.nvim_set_current_tabpage(vim.api.nvim_win_get_tabpage(session.win))
-    vim.api.nvim_set_current_win(session.win)
+  if target.state == 'ready' then
+    open_review(target)
+  elseif target.win and vim.api.nvim_win_is_valid(target.win) then
+    vim.api.nvim_set_current_tabpage(vim.api.nvim_win_get_tabpage(target.win))
+    vim.api.nvim_set_current_win(target.win)
   end
 
-  local drafts = sorted_drafts()
-  local review_event = session.review_event or 'COMMENT'
+  local drafts = sorted_drafts(target)
+  local review_event = target.review_event or 'COMMENT'
   local parent_win = vim.api.nvim_get_current_win()
   local parent_width = vim.api.nvim_win_get_width(parent_win)
   local parent_height = vim.api.nvim_win_get_height(parent_win)
@@ -715,14 +608,14 @@ function M.submit()
   vim.bo[buf].bufhidden = 'wipe'
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = 'markdown'
-  vim.api.nvim_buf_set_name(buf, ('meat-review://submission/%d'):format(session.pr.number))
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, split_body(session.review_body or ''))
+  vim.api.nvim_buf_set_name(buf, ('meat-review://submission/%d'):format(target.pr.number))
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, split_body(target.review_body or ''))
   vim.bo[buf].modified = false
   vim.wo[win].wrap = true
   vim.wo[win].number = false
   vim.wo[win].relativenumber = false
   vim.wo[win].signcolumn = 'no'
-  session.preview_buf, session.preview_win = buf, win
+  target.preview_buf, target.preview_win = buf, win
 
   local function close_submission()
     if vim.api.nvim_win_is_valid(win) then
@@ -731,8 +624,8 @@ function M.submit()
   end
 
   local function save()
-    session.review_body = normalize_body(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
-    session.review_event = review_event
+    target.review_body = normalize_body(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+    target.review_event = review_event
     vim.bo[buf].modified = false
   end
 
@@ -746,7 +639,7 @@ function M.submit()
     end
     index = ((index - 1 + direction) % #review_events) + 1
     review_event = review_events[index]
-    session.review_event = review_event
+    target.review_event = review_event
     render_submission_editor(buf, review_event, drafts)
   end
 
@@ -761,8 +654,8 @@ function M.submit()
     buffer = buf,
     once = true,
     callback = function()
-      if session.preview_buf == buf then
-        session.preview_buf, session.preview_win = nil, nil
+      if target.preview_buf == buf then
+        target.preview_buf, target.preview_win = nil, nil
       end
     end,
   })
@@ -776,7 +669,7 @@ function M.submit()
     local selected_event = event
     vim.keymap.set('n', tostring(index), function()
       review_event = selected_event
-      session.review_event = review_event
+      target.review_event = review_event
       render_submission_editor(buf, review_event, drafts)
     end, { buffer = buf, nowait = true, silent = true })
   end
@@ -785,21 +678,21 @@ function M.submit()
     close_submission()
   end, { buffer = buf, nowait = true, silent = true })
   vim.keymap.set('n', 'D', function()
-    session.review_body = ''
-    session.review_event = 'COMMENT'
+    target.review_body = ''
+    target.review_event = 'COMMENT'
     vim.bo[buf].modified = false
     close_submission()
     notify('Top-level review draft discarded; inline comments were kept.')
   end, { buffer = buf, nowait = true, silent = true })
   vim.keymap.set('n', 'S', function()
     save()
-    if review_event == 'REQUEST_CHANGES' and session.review_body == '' then
+    if review_event == 'REQUEST_CHANGES' and target.review_body == '' then
       return notify('Request changes requires an overall review comment.', vim.log.levels.WARN)
     end
-    if review_event == 'COMMENT' and session.review_body == '' and #drafts == 0 then
+    if review_event == 'COMMENT' and target.review_body == '' and #drafts == 0 then
       return notify('Add an overall or inline comment before submitting.', vim.log.levels.WARN)
     end
-    confirm_submission(drafts, session.review_body, review_event, win)
+    confirm_submission(target, drafts, target.review_body, review_event, win)
   end, { buffer = buf, nowait = true, silent = true })
   render_submission_editor(buf, review_event, drafts)
 end
